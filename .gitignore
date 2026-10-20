@@ -1,0 +1,27 @@
+﻿# Build output
+tsh
+tests/unit/*
+tests/property/*
+tests/integration/*
+!tests/unit/.gitkeep
+!tests/property/.gitkeep
+!tests/integration/.gitkeep
+
+# Object files
+*.o
+*.a
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Kiro internal (keep specs, ignore session state)
+.kiro/settings/
+.kiro/hooks/
+
+# theft PBT library (cloned by setup.sh on target machine)
+tests/theft/
+

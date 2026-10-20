@@ -1,0 +1,7 @@
+﻿# Force LF line endings on all text files (Linux target)
+* text=auto eol=lf
+*.c text eol=lf
+*.h text eol=lf
+Makefile text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
