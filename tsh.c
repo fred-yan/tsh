@@ -136,10 +136,11 @@ handler_t *Signal(int signum, handler_t *handler)
 int main(int argc, char **argv)
 {
     char cmdline[MAXLINE];
+    int  emit_prompt = 1;   /* suppressed by the -p flag (used by sdriver.pl) */
 
-    /* Suppress unused-parameter warnings for flags not yet wired up */
-    (void)argc;
-    (void)argv;
+    /* -p flag: suppress the prompt so trace output matches tshref exactly */
+    if (argc >= 2 && strcmp(argv[1], "-p") == 0)
+        emit_prompt = 0;
 
     /* Install signal handlers */
     Signal(SIGINT,  sigint_handler);
@@ -151,8 +152,10 @@ int main(int argc, char **argv)
 
     /* ── REPL ── */
     while (1) {
-        printf("tsh> ");
-        fflush(stdout);
+        if (emit_prompt) {
+            printf("tsh> ");
+            fflush(stdout);
+        }
 
         if (fgets(cmdline, MAXLINE, stdin) == NULL) {
             /* EOF on stdin — exit cleanly (Requirement 1.4) */
@@ -169,11 +172,79 @@ int main(int argc, char **argv)
 /* ───────────────────────────────────────────────────────────────────────────
  * eval — evaluate a command line
  *
- * Stub: empty body.  Full implementation in task 9 (eval + race protection).
+ * Parses @cmdline into an argv[] array via parseline(), then:
+ *
+ *   1. Ignores empty lines and parse errors (argv[0] == NULL or bg == -1).
+ *   2. Dispatches built-in commands (quit, jobs, bg, fg) to builtin_cmd(); returns
+ *      immediately if the command was a built-in.
+ *   3. For external commands: blocks SIGCHLD, forks a child, moves it into
+ *      its own process group with setpgid(0,0) so that SIGINT/SIGTSTP from
+ *      the terminal are not delivered to the shell itself (Requirement 11.1),
+ *      then exec's the command via execve().  The child restores its signal
+ *      mask before exec so the executed program inherits no blocked signals.
+ *      If execve fails the child prints an error message and exits.
+ *   4. In the parent, registers the new job with addjob() while SIGCHLD is
+ *      still blocked — guaranteeing addjob() always precedes any
+ *      sigchld_handler deletejob() call (Requirements 10.1, 10.2).
+ *      If the job list is full the child is killed immediately with SIGKILL.
+ *   5. SIGCHLD is unblocked (prev mask restored) after addjob() completes.
+ *   6. Background jobs (&): prints the standard "[jid] (pid) cmdline"
+ *      notification and returns immediately.
+ *   7. Foreground jobs: blocks in waitfg() until the job exits or stops.
+ *
+ * sigprocmask race protection (blocking SIGCHLD around fork/addjob) is
+ * included here per task 9.2 (Requirements 10.1, 10.2, 10.3, 10.4).
+ *
+ * Requirements: 2.1, 2.2, 2.3, 2.4, 2.5, 10.1, 10.2, 10.3, 10.4, 11.1
  * ─────────────────────────────────────────────────────────────────────────── */
 void eval(char *cmdline)
 {
-    (void)cmdline;
+    char     *argv[MAXARGS];
+    int       bg;
+    pid_t     pid;
+    sigset_t  mask_chld, prev; /* for SIGCHLD blocking */
+
+    bg = parseline(cmdline, argv);
+    if (bg == -1 || argv[0] == NULL)
+        return;
+    if (builtin_cmd(argv))
+        return;
+
+    /* Block SIGCHLD before fork to prevent race where child exits
+     * before addjob() is called (Requirements 10.1, 10.4) */
+    sigemptyset(&mask_chld);
+    sigaddset(&mask_chld, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &mask_chld, &prev);
+
+    if ((pid = fork()) < 0)
+        unix_error("fork error");
+
+    if (pid == 0) {
+        /* Child: restore signal mask BEFORE execve so that the
+         * executed program inherits no artificially blocked signals
+         * (Requirements 10.3, 10.4) */
+        sigprocmask(SIG_SETMASK, &prev, NULL);
+        setpgid(0, 0);
+        if (execve(argv[0], argv, environ) < 0) {
+            fprintf(stderr, "%s: Command not found\n", argv[0]);
+            exit(1);
+        }
+    }
+
+    /* Parent: addjob THEN unblock — guarantees addjob always runs
+     * before any sigchld_handler deletejob (Requirements 10.1, 10.2) */
+    if (!addjob(jobs, pid, bg ? BG : FG, cmdline)) {
+        sigprocmask(SIG_SETMASK, &prev, NULL);
+        kill(-pid, SIGKILL);
+        return;
+    }
+    sigprocmask(SIG_SETMASK, &prev, NULL); /* unblock SIGCHLD (Req 10.2) */
+
+    if (bg) {
+        printf("[%d] (%d) %s", pid2jid(pid), pid, cmdline);
+    } else {
+        waitfg(pid);
+    }
 }
 
 /* ───────────────────────────────────────────────────────────────────────────
@@ -246,32 +317,135 @@ int parseline(const char *cmdline, char **argv)
  * Returns 1 if @argv[0] is a built-in command (already handled),
  *         0 if not a built-in (caller should fork/exec).
  *
- * Stub: returns 0.  Full implementation in tasks 7 and 12.
+ * Handles: quit (terminates the shell), jobs (lists background jobs),
+ *          bg and fg (resume a stopped or background job).
  * ─────────────────────────────────────────────────────────────────────────── */
 int builtin_cmd(char **argv)
 {
-    (void)argv;
-    return 0;
+    if (strcmp(argv[0], "quit") == 0)
+        exit(0);                  /* quit: terminate the shell             */
+    if (strcmp(argv[0], "jobs") == 0) {
+        listjobs(jobs);           /* jobs: list all background jobs        */
+        return 1;
+    }
+    if (strcmp(argv[0], "bg") == 0 || strcmp(argv[0], "fg") == 0) {
+        do_bgfg(argv);            /* bg/fg: resume a stopped/bg job        */
+        return 1;
+    }
+    return 0;                     /* not a built-in command                */
 }
 
 /* ───────────────────────────────────────────────────────────────────────────
  * do_bgfg — implement the bg and fg built-in commands
  *
- * Stub: empty body.  Full implementation in task 12.
+ * Resumes a stopped (ST) or already-running background (BG) job, identified
+ * by either a PID (plain digits) or a job ID (%JID form).
+ *
+ * Argument validation:
+ *   - If argv[1] is NULL, prints a missing-argument error and returns.
+ *   - If argv[1] starts with '%', interprets the rest as a decimal JID and
+ *     looks the job up via getjobjid(); prints an error if not found.
+ *   - Otherwise argv[1] must be a string of pure digits (PID form); any
+ *     non-digit character triggers a format error.  The job is looked up via
+ *     getjobpid(); prints an error if not found.
+ *
+ * On success:
+ *   - Sends SIGCONT to the job's entire process group (kill with negative PID)
+ *     so all processes in the group are resumed (Requirements 6.3, 11.3).
+ *   - "fg": transitions the job to FG state and blocks in waitfg() until it
+ *     exits or stops again (Requirements 6.1, 6.5, 3.6).
+ *   - "bg": transitions the job to BG state and prints the standard
+ *     "[jid] (pid) cmdline" notification (Requirements 6.2, 3.7).
+ *
+ * Requirements: 6.1, 6.2, 6.3, 6.4, 6.5, 3.6, 3.7, 11.3
  * ─────────────────────────────────────────────────────────────────────────── */
 void do_bgfg(char **argv)
 {
-    (void)argv;
+    job_t *job;
+    int    jid;
+    pid_t  pid;
+    char  *id_arg = argv[1];  /* the PID or %JID argument */
+
+    /* ── Validate argument presence ───────────────────────────────────────── */
+    if (id_arg == NULL) {
+        printf("%s command requires PID or %%jobid argument\n", argv[0]);
+        return;
+    }
+
+    /* ── Resolve job by %JID or PID ───────────────────────────────────────── */
+    if (id_arg[0] == '%') {
+        /* JID form: must be '%' followed by one or more digits */
+        jid = atoi(id_arg + 1);
+        if (jid <= 0) {
+            printf("%s: argument must be a PID or %%jobid\n", argv[0]);
+            return;
+        }
+        job = getjobjid(jobs, jid);
+        if (job == NULL) {
+            printf("%%%d: No such job\n", jid);
+            return;
+        }
+    } else {
+        /* PID form: must be all digits */
+        char *p = id_arg;
+        while (*p) {
+            if (!isdigit((unsigned char)*p)) {
+                printf("%s: argument must be a PID or %%jobid\n", argv[0]);
+                return;
+            }
+            p++;
+        }
+        pid = (pid_t)atoi(id_arg);
+        if (pid <= 0) {
+            printf("%s: argument must be a PID or %%jobid\n", argv[0]);
+            return;
+        }
+        job = getjobpid(jobs, pid);
+        if (job == NULL) {
+            printf("(%d): No such process\n", pid);
+            return;
+        }
+    }
+
+    /* ── Send SIGCONT to the job's process group ───────────────────────────── */
+    kill(-(job->pid), SIGCONT);
+
+    /* ── Update state and wait (fg) or print notification (bg) ────────────── */
+    if (strcmp(argv[0], "fg") == 0) {
+        job->state = FG;
+        waitfg(job->pid);
+    } else { /* bg */
+        job->state = BG;
+        printf("[%d] (%d) %s", job->jid, (int)job->pid, job->cmdline);
+    }
 }
 
 /* ───────────────────────────────────────────────────────────────────────────
  * waitfg — block the shell until the foreground job exits or stops
  *
- * Stub: empty body.  Full implementation in task 8.
+ * Busy-wait loop: sleep 1 second at a time and recheck whether the
+ * foreground job is still present and still in FG state.
+ * Job removal and state transitions are handled exclusively by
+ * sigchld_handler — we must NOT call waitpid here.
+ *
+ * Requirements: 12.1, 12.2, 12.3, 12.4
  * ─────────────────────────────────────────────────────────────────────────── */
 void waitfg(pid_t pid)
 {
-    (void)pid;
+    /*
+     * Busy-wait loop: sleep 1 second at a time and recheck whether the
+     * foreground job is still present and still in FG state.
+     * Job removal and state transitions are handled exclusively by
+     * sigchld_handler — we must NOT call waitpid here.
+     *
+     * Requirements: 12.1, 12.2, 12.3, 12.4
+     */
+    while (1) {
+        job_t *job = getjobpid(jobs, pid);
+        if (job == NULL || job->state != FG)
+            break;
+        sleep(1);
+    }
 }
 
 /* ───────────────────────────────────────────────────────────────────────────
@@ -280,29 +454,114 @@ void waitfg(pid_t pid)
 
 /*
  * sigchld_handler — reap zombie children and update the job list.
- * Stub: empty body.  Full implementation in task 10.
+ *
+ * Called whenever one or more children change state (exit, killed by signal,
+ * or stopped).  Loops with waitpid(WNOHANG|WUNTRACED) to drain all pending
+ * state changes in a single handler invocation, because SIGCHLD is not queued
+ * — only one signal is pending no matter how many children changed state.
+ *
+ * For each reaped child:
+ *   - Normal exit        → delete the job from the job list.
+ *   - Killed by signal   → print a termination message, delete the job.
+ *   - Stopped by signal  → update job state to ST, print a stop message.
+ *
+ * errno is saved and restored to preserve async-signal safety.
+ *
+ * Requirements: 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 3.6, 8.4
  */
 void sigchld_handler(int sig)
 {
-    (void)sig;
+    int    olderrno = errno; /* save errno — must restore before returning    */
+    int    status;
+    pid_t  pid;
+    job_t *job;
+
+    (void)sig; /* parameter unused; sig is always SIGCHLD here */
+
+    /*
+     * Loop with WNOHANG|WUNTRACED:
+     *   WNOHANG   — return immediately if no child has changed state
+     *   WUNTRACED — also report stopped (not just exited) children
+     *
+     * We loop because multiple children may have changed state since the
+     * last delivery; SIGCHLD is not queued — only one signal is pending
+     * regardless of how many children exited, so a single waitpid call
+     * would miss all but the first.
+     *
+     * Requirements: 9.1, 9.2, 9.3, 9.4, 9.5, 9.6, 3.6, 8.4
+     */
+    while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED)) > 0) {
+
+        job = getjobpid(jobs, pid);
+        if (job == NULL)
+            continue; /* unknown PID — silently ignore (Requirement 9.6) */
+
+        if (WIFEXITED(status)) {
+            /* Child exited normally */
+            deletejob(jobs, pid);
+
+        } else if (WIFSIGNALED(status)) {
+            /* Child terminated by an uncaught signal (e.g. SIGINT) */
+            printf("Job [%d] (%d) terminated by signal %d\n",
+                   job->jid, pid, WTERMSIG(status));
+            deletejob(jobs, pid);
+
+        } else if (WIFSTOPPED(status)) {
+            /* Child stopped (e.g. SIGTSTP) */
+            job->state = ST;
+            printf("Job [%d] (%d) stopped by signal %d\n",
+                   job->jid, pid, WSTOPSIG(status));
+        }
+    }
+
+    errno = olderrno; /* restore errno before returning (async-signal safety) */
 }
 
 /*
  * sigint_handler — forward SIGINT to the foreground process group.
- * Stub: empty body.  Full implementation in task 11.
+ *
+ * When the user types Ctrl-C, the terminal delivers SIGINT to every process
+ * in the foreground process group — including tsh itself.  We intercept it
+ * here and re-deliver it to the process GROUP of the current foreground job
+ * using kill(-pid, SIGINT), so the entire job (including any children it may
+ * have forked) receives the signal, while tsh is unaffected.
+ *
+ * Requirements: 7.1, 7.2, 7.3, 11.2, 11.4
  */
 void sigint_handler(int sig)
 {
+    int   olderrno = errno;
+    pid_t pid = fgpid(jobs);  /* PID of current foreground job (0 if none) */
+
     (void)sig;
+
+    if (pid != 0)
+        kill(-pid, SIGINT);   /* negative: send to entire process group     */
+
+    errno = olderrno;
 }
 
 /*
  * sigtstp_handler — forward SIGTSTP to the foreground process group.
- * Stub: empty body.  Full implementation in task 11.
+ *
+ * Ctrl-Z delivers SIGTSTP to the terminal's foreground process group.
+ * We forward it to the foreground job's process group with kill(-pid, SIGTSTP)
+ * so the job (and its children) are stopped.  sigchld_handler will then
+ * update the job state to ST when the kernel delivers SIGCHLD.
+ *
+ * Requirements: 8.1, 8.2, 8.3, 8.4, 11.2, 11.4
  */
 void sigtstp_handler(int sig)
 {
+    int   olderrno = errno;
+    pid_t pid = fgpid(jobs);  /* PID of current foreground job (0 if none) */
+
     (void)sig;
+
+    if (pid != 0)
+        kill(-pid, SIGTSTP);  /* negative: send to entire process group     */
+
+    errno = olderrno;
 }
 
 /* ───────────────────────────────────────────────────────────────────────────
